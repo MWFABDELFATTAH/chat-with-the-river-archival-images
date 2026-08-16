@@ -3,15 +3,15 @@ import pandas as pd
 import gradio as gr
 import re
 import base64
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from PIL import Image
 import io
 from skimage import segmentation, color
 import numpy as np
 
-# 1. Setup Google Gemini
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-model = genai.GenerativeModel('gemini-3.5-flash')
+# 1. Setup Google Gemini (Using the new google-genai SDK)
+client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 # 2. Load Excel Data
 try:
@@ -22,7 +22,6 @@ except Exception as e:
     df = pd.DataFrame()
 
 def get_image_data(image_id):
-    # Looking in the main root folder (".") since images are alongside app.py
     img_dir = "."
         
     for filename in os.listdir(img_dir):
@@ -49,14 +48,10 @@ def generate_segmentation_image(img_bytes):
     """Generates a semantic segmentation map, optimizing size"""
     try:
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        
-        # Resize image to max 800px to prevent freezing on Hugging Face free tier
         max_size = (800, 800)
         img.thumbnail(max_size, Image.Resampling.LANCZOS)
-        
         img_array = np.array(img)
         
-        # Apply SLIC segmentation
         segments = segmentation.slic(img_array, n_segments=100, compactness=10, start_label=1)
         segmented_img = color.label2rgb(segments, img_array, kind='avg', bg_label=0)
         
@@ -123,17 +118,18 @@ def answer_question(user_prompt, history):
         """
         
         try:
-            # Pass the raw image bytes directly to Gemini
-            response = model.generate_content([
-                strict_prompt,
-                {"mime_type": mime_type, "data": img_bytes}
-            ])
+            # Use the new google-genai SDK format
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=[
+                    strict_prompt,
+                    types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
+                ]
+            )
             response_text = response.text
             
-            # Generate the Semantic Segmentation Image
             seg_base64 = generate_segmentation_image(img_bytes)
             
-            # Format final output with 4 paragraphs and 2 images
             final_response = f"**Archival Image ID {requested_id}**\n\n{response_text}\n\n"
             final_response += f"**Original Archival Image:**\n![Image](data:{mime_type};base64,{base64_img})\n\n"
             
@@ -159,6 +155,5 @@ demo = gr.ChatInterface(
     description="Type an ID (1-156) to see the archival photo, receive a 4-paragraph analysis, and see semantic segmentation."
 )
 
-# Hugging Face Spaces expects port 7860
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)))
