@@ -2,6 +2,8 @@ pandas
 gradio
 google-generativeai
 openpyxl
-scikit-image
 numpy
+scikit-learn
 Pillow
+gTTS
+audioop-lts
