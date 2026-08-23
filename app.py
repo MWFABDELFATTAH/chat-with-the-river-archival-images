@@ -34,20 +34,24 @@ def compress_image_to_base64(img_path):
     except:
         return None
 
-def get_native_images(archive_id):
-    """Loads the 3 images as native PIL Image objects so Gradio can render them"""
-    images_list = []
+def get_markdown_images(archive_id):
+    """Converts the 3 images into Markdown image tags so they display BEFORE the text"""
     orig_path = get_image_path(archive_id)
-    
-    # UPDATED PATHS: Looking directly in the main folder, not in subfolders
     seg_path = f"seg_{archive_id}.jpg"
     col_path = f"colors_{archive_id}.jpg"
     
-    if orig_path and os.path.exists(orig_path): images_list.append(Image.open(orig_path))
-    if os.path.exists(seg_path): images_list.append(Image.open(seg_path))
-    if os.path.exists(col_path): images_list.append(Image.open(col_path))
+    md = ""
+    if orig_path and os.path.exists(orig_path):
+        with open(orig_path, "rb") as f: b64 = base64.b64encode(f.read()).decode('utf-8')
+        md += f"![Original Archive](data:image/jpeg;base64,{b64})\n"
+    if os.path.exists(seg_path):
+        with open(seg_path, "rb") as f: b64 = base64.b64encode(f.read()).decode('utf-8')
+        md += f"![Semantic Segmentation](data:image/jpeg;base64,{b64})\n"
+    if os.path.exists(col_path):
+        with open(col_path, "rb") as f: b64 = base64.b64encode(f.read()).decode('utf-8')
+        md += f"![Dominant Colour Palette](data:image/jpeg;base64,{b64})\n"
         
-    return images_list, orig_path
+    return md + "\n"
 
 def answer_question(user_text, history):
     if df.empty: return "Error loading data."
@@ -60,7 +64,7 @@ def answer_question(user_text, history):
     # SCENARIO A: Multiple Archives Requested (e.g., "Compare 6 and 13")
     if len(requested_ids) > 1:
         parts = [f"The user asked: '{user_text}'. Here are the requested archives for you to compare/analyze:"]
-        images_to_return = []
+        md_images = ""
         
         for archive_id in requested_ids:
             match_df = df[df['ID'].astype(str).str.strip() == str(archive_id)]
@@ -73,7 +77,7 @@ def answer_question(user_text, history):
                 if img_b64:
                     parts.append(f"Archive ID {archive_id} ({title}):")
                     parts.append(types.Part.from_bytes(data=base64.b64decode(img_b64), mime_type="image/jpeg"))
-                    images_to_return.append(Image.open(orig_path))
+                    md_images += f"![Archive {archive_id}](data:image/jpeg;base64,{img_b64})\n"
 
         prompt = f"""
         CRITICAL RULES:
@@ -85,7 +89,7 @@ def answer_question(user_text, history):
         try:
             res = client.models.generate_content(model="gemini-3.6-flash", contents=parts + [prompt])
             res_text = res.text
-            return {"text": res_text, "images": images_to_return}
+            return f"{md_images}\n{res_text}"
         except Exception as e:
             return f"Error comparing archives: {str(e)}"
 
@@ -123,9 +127,9 @@ def answer_question(user_text, history):
                     contents.append(types.Part.from_bytes(data=base64.b64decode(img_b64), mime_type="image/jpeg"))
                 res = client.models.generate_content(model="gemini-3.6-flash", contents=contents)
                 
-                # Return 3 images natively for follow-ups too
-                images_list, _ = get_native_images(archive_id)
-                return {"text": res.text, "images": images_list}
+                # Return 3 images for follow-up queries too
+                md_images = get_markdown_images(archive_id)
+                return f"{md_images}\n{res.text}"
             except Exception as e:
                 return f"Error: {str(e)}"
         else:
@@ -148,7 +152,8 @@ def answer_question(user_text, history):
     source = str(row.get('Source', 'N/A'))
     csv_context = f"Title: {title}\nCreator: {artist}\nDate: {date}\nStyle: {style}\nSource: {source}"
     
-    images_list, orig_path = get_native_images(archive_id)
+    md_images = get_markdown_images(archive_id)
+    orig_path = get_image_path(archive_id)
     img_b64 = compress_image_to_base64(orig_path) if orig_path else None
 
     prompt = f"""
@@ -175,12 +180,12 @@ def answer_question(user_text, history):
         res = client.models.generate_content(model="gemini-3.6-flash", contents=contents)
         res_text = res.text
 
-        return {"text": res_text, "images": images_list}
+        return f"{md_images}\n{res_text}"
     except Exception as e:
         return f"Error generating response: {str(e)}"
 
-# multimodal=True is REQUIRED for Gradio to render the "images" list natively
-demo = gr.ChatInterface(fn=answer_question, type="messages", multimodal=True, title="Adelaide Archives AI (1-156)")
+# Removed type="messages" and multimodal=True to fix the TypeError and hide the upload button
+demo = gr.ChatInterface(fn=answer_question, title="Adelaide Archives AI (1-156)")
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)))
