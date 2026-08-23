@@ -2,158 +2,149 @@ import os
 import pandas as pd
 import gradio as gr
 import re
-import base64
 from google import genai
 from google.genai import types
 from PIL import Image
 import io
-from skimage import segmentation, color
-import numpy as np
 
-# 1. Setup Google Gemini (Using the new google-genai SDK)
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+# 1. Setup Google Gemini 
+client = genai.Client(api_key=os.environ.get("gemini_API_KEY"))
 
 # 2. Load Excel Data
 try:
     df = pd.read_excel("data.xlsx")
     df.columns = df.columns.str.strip()
 except Exception as e:
-    print(f"Error loading Excel: {e}")
     df = pd.DataFrame()
 
-def get_image_data(image_id):
-    img_dir = "."
-        
-    for filename in os.listdir(img_dir):
-        ext = filename.split('.')[-1].lower()
-        if filename.lower().startswith(f"{image_id}.") and ext in ["jpg", "jpeg", "png", "webp"]:
-            img_path = os.path.join(img_dir, filename)
-            with open(img_path, "rb") as image_file:
-                img_bytes = image_file.read()
-                
-            if ext in ["jpg", "jpeg"]:
-                mime_type = "image/jpeg"
-            elif ext == "png":
-                mime_type = "image/png"
-            elif ext == "webp":
-                mime_type = "image/webp"
-            else:
-                mime_type = "image/jpeg"
-                
-            return img_path, img_bytes, mime_type
-            
-    return None, None, "Error: Image file not found."
+def get_image_path(image_id):
+    for filename in os.listdir("."):
+        if filename.lower().startswith(f"{image_id}.") and filename.split('.')[-1].lower() in ["jpg", "jpeg", "png", "webp"]:
+            return filename
+    return None
 
-def generate_segmentation_image(img_bytes):
-    """Generates a semantic segmentation map, optimizing size"""
+def compress_image_for_gemini(img_path):
+    """Compresses image to 512px to prevent RAM crashes and speed up API"""
     try:
-        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        max_size = (800, 800)
-        img.thumbnail(max_size, Image.Resampling.LANCZOS)
-        img_array = np.array(img)
+        img = Image.open(img_path).convert("RGB")
+        img.thumbnail((512, 512), Image.Resampling.LANCZOS)
+        buffer = io.BytesIO()
+        img.save(buffer, format="JPEG", quality=65)
+        return buffer.getvalue()
+    except:
+        with open(img_path, "rb") as f: return f.read()
+
+def answer_question(user_text, history):
+    if df.empty: return "Error loading data."
+    
+    user_text = user_text.strip()
+    nums = re.findall(r'\b(\d+)\b', user_text)
+    art_id = None
+    for n in nums:
+        if 1 <= int(n) <= 156:
+            art_id = int(n)
+            break
+
+    # SCENARIO A: No number provided (Handles BOTH Follow-ups AND General Questions)
+    if not art_id:
+        if not user_text: return "Please enter a number 1-156."
+        csv_data = df.to_string(index=False)
+        is_followup = False
+        if history:
+            matches = re.findall(r'Artwork ID (\d+)', str(history))
+            if matches:
+                art_id = int(matches[-1])
+                is_followup = True
+
+        if is_followup:
+            row = df[df['ID'].astype(str).str.strip() == str(art_id)].iloc[0]
+            title = str(row.get('TITLE', 'Unknown'))
+            orig_path = get_image_path(art_id)
+            img_bytes = compress_image_for_gemini(orig_path) if orig_path else None
+
+            prompt = f"""
+            The user asked: "{user_text}"
+            You are currently analyzing Artwork ID {art_id} ({title}). The image is attached.
+            The full database metadata for all 156 artworks is provided below:
+            {csv_data}
+            INSTRUCTIONS:
+            - If the user is asking a follow-up question or challenging your previous analysis about Artwork {art_id}, respond conversationally in under 150 words based on the attached image.
+            - If the user is asking a GENERAL question (e.g., "which ones have boats or animals?"), IGNORE the attached image and answer their question by searching the database metadata provided above. List the Artwork IDs and Titles.
+            - YOU MUST NOT HALLUCINATE. Use only the provided data.
+            """
+            try:
+                contents = [prompt]
+                if img_bytes:
+                    contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
+                res = client.models.generate_content(model="gemini-3.7-flash", contents=contents)
+                return res.text
+            except Exception as e:
+                return f"Error: {str(e)}"
+        else:
+            prompt = f"""
+            The user asked: "{user_text}"
+            Here is the archival database metadata for all 156 artworks:
+            {csv_data}
+            Instructions: Answer the user's question using ONLY the database metadata provided above. List Artwork IDs and Titles. DO NOT HALLUCINATE.
+            """
+            res = client.models.generate_content(model="gemini-3.7-flash", contents=prompt)
+            return res.text
+
+    # SCENARIO B: Fresh request for a Single Artwork
+    row = df[df['ID'].astype(str).str.strip() == str(art_id)].iloc[0]
+    title = str(row.get('TITLE', 'Unknown'))
+    artist = str(row.get('Artist (if known)', 'Unknown'))
+    date = str(row.get('Date', 'Unknown'))
+    style = str(row.get('Artistic style', 'Unknown'))
+    source = str(row.get('Source', 'N/A'))
+    csv_context = f"Title: {title}\nArtist: {artist}\nDate: {date}\nStyle: {style}\nSource: {source}"
+    
+    orig_path = get_image_path(art_id)
+    seg_path = f"preloaded_segments/seg_{art_id}.jpg"
+    col_path = f"preloaded_colors/colors_{art_id}.jpg"
+    img_bytes = compress_image_for_gemini(orig_path) if orig_path else None
+
+    prompt = f"""
+    You are a strict, analytical art historian. You are analyzing artwork ID {art_id}.
+    Here is the EXACT archival data for this artwork:
+    {csv_context}
+
+    CRITICAL RULES (STRICTLY ENFORCED):
+    1. YOU MUST NOT HALLUCINATE. Do not use any outside knowledge. If the archival data says 'Unknown' for the Artist, you MUST state "Artist Unknown". Do not invent names, dates, or historical facts not present in the archival data.
+    2. YOUR RESPONSE MUST BE EXACTLY FOUR PARAGRAPHS. EACH PARAGRAPH MUST BE AT LEAST 150 WORDS. THE TOTAL RESPONSE MUST BE OVER 600 WORDS.
+    3. Do not provide generic introductions or conclusions. Go directly into deep, analytical prose.
+
+    PARAGRAPH STRUCTURE AND REQUIREMENTS:
+    - Paragraph 1 (Archival & Contextual Analysis): Analyze the artwork using ONLY the archival data provided above. Discuss the title, artist (if known), date, artistic style, and source. Do not invent historical context; rely strictly on the provided metadata.
+    - Paragraph 2 (Visual Analysis): Analyze the visual composition of the attached image. Discuss the mood, lighting, brushwork, and materiality based strictly on what you see in the attached image.
+    - Paragraph 3 (Urban & Environmental Context): Relate the artwork to the urban and environmental history of Adelaide based strictly on the visual evidence (e.g., infrastructure, landscape, River Torrens, colonial settlement) and the archival date. Do not invent historical figures.
+    - Paragraph 4 (Semantic Segmentation Analysis): You are looking at the original image. Conduct a rigorous textual analysis of how a semantic segmentation algorithm would break down this image. Discuss the distinct spatial regions, boundaries, and color fields (e.g., sky, water, land, architecture, figures). Explain what this computational breakdown reveals about the composition and spatial hierarchy of the artwork.
+    """
+    
+    try:
+        contents = [prompt]
+        if img_bytes:
+            contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
+        res = client.models.generate_content(model="gemini-3.7-flash", contents=contents)
+        res_text = res.text
+
+        text_md = f"**Artwork ID {art_id}**\n\n{res_text}\n\n---\n"
         
-        segments = segmentation.slic(img_array, n_segments=100, compactness=10, start_label=1)
-        segmented_img = color.label2rgb(segments, img_array, kind='avg', bg_label=0)
-        
-        seg_pil = Image.fromarray((segmented_img * 255).astype(np.uint8))
-        byte_arr = io.BytesIO()
-        seg_pil.save(byte_arr, format='JPEG')
-        seg_bytes = byte_arr.getvalue()
-        
-        seg_base64 = base64.b64encode(seg_bytes).decode('utf-8')
-        return seg_base64
+        # Collect 3 image paths to send back to Gradio natively
+        files_to_return = []
+        if orig_path and os.path.exists(orig_path): files_to_return.append(orig_path)
+        if os.path.exists(seg_path): files_to_return.append(seg_path)
+        if os.path.exists(col_path): files_to_return.append(col_path)
+
+        return {
+            "text": text_md,
+            "files": files_to_return
+        }
     except Exception as e:
-        print(f"Segmentation error: {e}")
-        return None
+        return f"Error generating response: {str(e)}"
 
-# 3. The Chat Engine
-def answer_question(user_prompt, history):
-    if df.empty:
-        return "Error: Could not load data.xlsx."
-        
-    user_prompt_lower = user_prompt.lower()
-    numbers = re.findall(r'\b(\d+)\b', user_prompt_lower)
-    
-    matched_id_row = None
-    requested_id = None
-    
-    for num in numbers:
-        if 1 <= int(num) <= 156:
-            match_df = df[df['ID'].astype(str).str.strip() == num]
-            if not match_df.empty:
-                matched_id_row = match_df.iloc[0]
-                requested_id = num
-                break
-            
-    if matched_id_row is not None:
-        row = matched_id_row
-        title = str(row.get('TITLE', 'Unknown Title'))
-        date = str(row.get('Date', 'Unknown Date'))
-        
-        img_path, img_bytes, mime_or_error = get_image_data(requested_id)
-        
-        if not img_bytes:
-            return f"**Archival Image ID {requested_id}:** {title} ({date}).\n\n*({mime_or_error})*"
-
-        mime_type = mime_or_error
-        base64_img = base64.b64encode(img_bytes).decode('utf-8')
-        
-        csv_context = f"""
-        Title: {title}
-        Date: {date}
-        Description: {row.get('Description', 'N/A')}
-        """
-        
-        strict_prompt = f"""
-        You are an expert heritage archivist and computer vision analyst. The user requested information about Archival Image ID {requested_id}.
-        Here is the archival data for this image:
-        {csv_context}
-        
-        RULES (DO NOT HALLUCINATE METADATA):
-        1. YOUR RESPONSE MUST BE EXACTLY FOUR PARAGRAPHS.
-        2. Paragraph 1: Introduce the archival image. State the exact ID, Title, and Date. Provide a brief contextual background based on the archival data provided.
-        3. Paragraph 2: Conduct a visual analysis of the attached image. Describe what you actually see (composition, colors, subjects, landscape, buildings, people).
-        4. Paragraph 3: Explain how this image relates to the urban history of Adelaide as a city (e.g., colonial settlement, development of the River Torrens, infrastructure, or relations with Indigenous peoples).
-        5. Paragraph 4: Conduct a textual analysis of the semantic segmentation of this image. Describe how the image can be broken down into semantic regions (e.g., sky, water, land, architecture, figures) and what these distinct segments represent in the context of the scene.
-        """
-        
-        try:
-            # Use the new google-genai SDK format
-            response = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=[
-                    strict_prompt,
-                    types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
-                ]
-            )
-            response_text = response.text
-            
-            seg_base64 = generate_segmentation_image(img_bytes)
-            
-            final_response = f"**Archival Image ID {requested_id}**\n\n{response_text}\n\n"
-            final_response += f"**Original Archival Image:**\n![Image](data:{mime_type};base64,{base64_img})\n\n"
-            
-            if seg_base64:
-                final_response += f"**Semantic Segmentation Map:**\n![Segmentation](data:image/jpeg;base64,{seg_base64})"
-            else:
-                final_response += "*(Semantic segmentation image could not be generated)*"
-                
-            return final_response
-        except Exception as e:
-            return f"Error generating response: {str(e)}"
-            
-    else:
-        return "Please enter a valid archival image number between **1 and 156** to see the image, receive a 4-paragraph analysis, and see semantic segmentation."
-
-# 4. Gradio Interface
-def torrens_chat(user_message, history):
-    return answer_question(user_message, history)
-
-demo = gr.ChatInterface(
-    fn=torrens_chat,
-    title="Torrens Heritage AI (1-156)",
-    description="Type an ID (1-156) to see the archival photo, receive a 4-paragraph analysis, and see semantic segmentation."
-)
+# multimodal=False removes the upload button, making the UI much cleaner and faster
+demo = gr.ChatInterface(fn=answer_question, title="Torrens Archives AI (1-156)")
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)))
