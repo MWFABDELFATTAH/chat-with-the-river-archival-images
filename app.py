@@ -25,7 +25,6 @@ def get_image_path(archive_id):
     return None
 
 def compress_image_to_base64(img_path):
-    """Compresses image to 512px and converts to base64"""
     try:
         img = Image.open(img_path).convert("RGB")
         img.thumbnail((512, 512), Image.Resampling.LANCZOS)
@@ -35,33 +34,20 @@ def compress_image_to_base64(img_path):
     except:
         return None
 
-def image_to_html(filepath, caption):
-    """Reads pre-processed image, converts to base64, and wraps in HTML to display BEFORE text"""
-    if not filepath or not os.path.exists(filepath): return ""
-    try:
-        with open(filepath, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode('utf-8')
-        return f"""
-        <div style="display:inline-block; width:32%; vertical-align:top; margin-right:1%;">
-            <p style="font-weight:bold; font-size:14px; margin-bottom:5px;">{caption}</p>
-            <img src="data:image/jpeg;base64,{b64}" style="width:100%; border-radius:8px; border:1px solid #444;">
-        </div>
-        """
-    except:
-        return ""
-
-def generate_html_images(archive_id):
-    """Generates the HTML block for the 3 standard images"""
+def get_native_images(archive_id):
+    """Loads the 3 images as native PIL Image objects so Gradio can render them"""
+    images_list = []
     orig_path = get_image_path(archive_id)
-    seg_path = f"preloaded_segments/seg_{archive_id}.jpg"
-    col_path = f"preloaded_colors/colors_{archive_id}.jpg"
     
-    html_images = "<div style='margin-bottom: 20px; overflow: hidden;'>"
-    html_images += image_to_html(orig_path, "Original Archive")
-    html_images += image_to_html(seg_path, "Semantic Segmentation")
-    html_images += image_to_html(col_path, "Dominant Colour Palette")
-    html_images += "</div><br>"
-    return html_images, orig_path
+    # UPDATED PATHS: Looking directly in the main folder, not in subfolders
+    seg_path = f"seg_{archive_id}.jpg"
+    col_path = f"colors_{archive_id}.jpg"
+    
+    if orig_path and os.path.exists(orig_path): images_list.append(Image.open(orig_path))
+    if os.path.exists(seg_path): images_list.append(Image.open(seg_path))
+    if os.path.exists(col_path): images_list.append(Image.open(col_path))
+        
+    return images_list, orig_path
 
 def answer_question(user_text, history):
     if df.empty: return "Error loading data."
@@ -74,7 +60,7 @@ def answer_question(user_text, history):
     # SCENARIO A: Multiple Archives Requested (e.g., "Compare 6 and 13")
     if len(requested_ids) > 1:
         parts = [f"The user asked: '{user_text}'. Here are the requested archives for you to compare/analyze:"]
-        html_images = "<div style='margin-bottom: 20px;'>"
+        images_to_return = []
         
         for archive_id in requested_ids:
             match_df = df[df['ID'].astype(str).str.strip() == str(archive_id)]
@@ -87,8 +73,7 @@ def answer_question(user_text, history):
                 if img_b64:
                     parts.append(f"Archive ID {archive_id} ({title}):")
                     parts.append(types.Part.from_bytes(data=base64.b64decode(img_b64), mime_type="image/jpeg"))
-                    html_images += image_to_html(orig_path, f"Archive {archive_id}")
-        html_images += "</div><br>"
+                    images_to_return.append(Image.open(orig_path))
 
         prompt = f"""
         CRITICAL RULES:
@@ -100,7 +85,7 @@ def answer_question(user_text, history):
         try:
             res = client.models.generate_content(model="gemini-3.6-flash", contents=parts + [prompt])
             res_text = res.text
-            return f"{html_images}\n\n{res_text}"
+            return {"text": res_text, "images": images_to_return}
         except Exception as e:
             return f"Error comparing archives: {str(e)}"
 
@@ -138,9 +123,9 @@ def answer_question(user_text, history):
                     contents.append(types.Part.from_bytes(data=base64.b64decode(img_b64), mime_type="image/jpeg"))
                 res = client.models.generate_content(model="gemini-3.6-flash", contents=contents)
                 
-                # Strictly return the 3 images for this follow-up query as well
-                html_images, _ = generate_html_images(archive_id)
-                return f"{html_images}\n\n{res.text}"
+                # Return 3 images natively for follow-ups too
+                images_list, _ = get_native_images(archive_id)
+                return {"text": res.text, "images": images_list}
             except Exception as e:
                 return f"Error: {str(e)}"
         else:
@@ -163,7 +148,7 @@ def answer_question(user_text, history):
     source = str(row.get('Source', 'N/A'))
     csv_context = f"Title: {title}\nCreator: {artist}\nDate: {date}\nStyle: {style}\nSource: {source}"
     
-    html_images, orig_path = generate_html_images(archive_id)
+    images_list, orig_path = get_native_images(archive_id)
     img_b64 = compress_image_to_base64(orig_path) if orig_path else None
 
     prompt = f"""
@@ -173,7 +158,7 @@ def answer_question(user_text, history):
 
     CRITICAL RULES (STRICTLY ENFORCED):
     1. YOU MUST NOT HALLUCINATE. Do not use any outside knowledge. If the archival data says 'Unknown' for the Creator, you MUST state "Creator Unknown". Do not invent names, dates, or historical facts not present in the archival data.
-    2. YOUR RESPONSE MUST BE EXACTLY FOUR PARAGRAPHS. EACH PARAGRAPH MUST BE CONCISE (about 100 words each). Total ~400 words.
+    2. YOUR RESPONSE MUST BE EXACTLY FOUR PARAGRAPHS. EACH PARAGRAPH MUST BE CONCISE (about 80 words each). Total ~300 words.
     3. Your response must be STRAIGHTFORWARD, SYSTEMATIC, AND BENEFICIAL. STRICTLY NO REPETITION of phrases or concepts between paragraphs. Do not provide generic introductions or conclusions. Go directly into deep, analytical prose.
 
     PARAGRAPH STRUCTURE AND REQUIREMENTS:
@@ -190,12 +175,12 @@ def answer_question(user_text, history):
         res = client.models.generate_content(model="gemini-3.6-flash", contents=contents)
         res_text = res.text
 
-        return f"{html_images}\n\n{res_text}"
+        return {"text": res_text, "images": images_list}
     except Exception as e:
         return f"Error generating response: {str(e)}"
 
-# Updated title to reflect "Archives"
-demo = gr.ChatInterface(fn=answer_question, title="Adelaide Archives AI (1-156)")
+# multimodal=True is REQUIRED for Gradio to render the "images" list natively
+demo = gr.ChatInterface(fn=answer_question, type="messages", multimodal=True, title="Adelaide Archives AI (1-156)")
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)))
